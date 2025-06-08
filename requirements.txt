@@ -6,3 +6,5 @@ cv2
 pillow
 aiohttp
 werkzeug
+dotenv
+matplotlib
