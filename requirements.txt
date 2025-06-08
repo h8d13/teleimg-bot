@@ -1,0 +1,8 @@
+schedule
+numpy
+telegram
+python-telegram-bot
+cv2
+pillow
+aiohttp
+werkzeug
