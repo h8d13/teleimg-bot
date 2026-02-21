@@ -16,6 +16,7 @@ import sqlite3
 # TELEGRAM & CV2
 import cv2
 from PIL import Image
+import telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 import matplotlib.pyplot as plt
@@ -29,7 +30,7 @@ from werkzeug.utils import safe_join
 
 # INTERNAL IMPORTS
 from models import MODELS
-from inf import current_model, middle_value, low_value_threshold, high_value_threshold, TOKEN, DEVELOPER_CHAT_ID, DEVELOPER_PASSWORD, MAX_REQUESTS, TIME_WINDOW 
+from inf import current_model, middle_value, low_value_threshold, high_value_threshold, TOKEN, DEVELOPER_PASSWORD, MAX_REQUESTS, TIME_WINDOW
 from helpers import escape_markdown, secure_filename, generate_callback_data, parse_callback_data, cleanup_old_files, generate_main_keyboard
 
 # THREADING
@@ -85,9 +86,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     welcome_message = (
         f"Welcome *{user_name}* to SnapWave\n\n"
         "Please send your image as a file to avoid compression: *Press \\📎 then File\\>Gallery* \n\n"
-        "Not 100 percent sure it works on Apple devices\\. Available commands:\n\n"
+        "⚠️ Do not send using only 'gallery' only, or your image will be compressed\\. ⚠️\n\n"
         "/start \\- Display this welcome message\n"
-        "/remove \\- Remove your files from the system directly\\.\n"
+        "/remove \\- Remove your files from the system directly\\.\n\n"
         "IMPORTANT,  *Press \\📎 then File\\>Gallery*\\. You will get a corrected version of the image back\\.\n\n"
     )
     await update.message.reply_text(welcome_message, parse_mode='MarkdownV2')
@@ -280,8 +281,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     document = update.message.document
 
-    if document.file_size > 30 * 1024 * 1024:
-        await update.message.reply_text("File size is too large. Please send an image smaller than 30 MB.")
+    if document.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("File size is too large. Please send an image smaller than 20 MB.")
         return
 
     try:
@@ -392,7 +393,8 @@ async def apply_more_models(action, session_id, update, context):
             else:
                 raise ValueError("Invalid action")
 
-            processed_filename = secure_filename(f"{action}_{os.path.basename(original_file_path)}")
+            ext = os.path.splitext(original_file_path)[1] or '.jpg'
+            processed_filename = f"{uuid.uuid4().hex}_{action}{ext}"
             processed_path = os.path.join('uploads', processed_filename)
 
             cv2.imwrite(processed_path, processed)
@@ -407,20 +409,24 @@ async def apply_more_models(action, session_id, update, context):
                     reply_markup=reply_markup
                 )
 
-            # Update the session info with the new file path
+            # Remove the old file from disk and session tracking
+            if os.path.exists(original_file_path):
+                os.remove(original_file_path)
+            if original_file_path in session_info['adjusted']:
+                session_info['adjusted'].remove(original_file_path)
+            context.user_data['files_to_delete'] = [
+                f for f in context.user_data.get('files_to_delete', [])
+                if f['path'] != original_file_path
+            ]
+
+            # Track the new file
             session_info['adjusted'].append(processed_path)
             context.user_data['image_sessions'][session_id] = session_info
-
-            # Add the new file to the files_to_delete list
             context.user_data.setdefault('files_to_delete', []).append({
                 'path': processed_path,
                 'timestamp': time.time(),
                 'session_id': session_id
             })
-
-            # Remove the old file
-            if os.path.exists(original_file_path):
-                os.remove(original_file_path)
 
         else:
             logger.error(f"File not found: {original_file_path}")
@@ -439,7 +445,19 @@ async def process_image_async(image, model):
 ## ACTIONS
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+
+    # Block spamming: if already processing, ignore
+    if context.user_data.get('processing', False):
+        try:
+            await query.answer(text="Please wait, still processing...", show_alert=False)
+        except telegram.error.BadRequest:
+            pass
+        return
+
+    try:
+        await query.answer()
+    except telegram.error.BadRequest:
+        return
 
     logger.info(f"Received callback data: {query.data}")
 
@@ -458,7 +476,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text("This image session has expired or is invalid.")
         logger.error(f"Session not found for session_id: {session_id}")
         return
-    
+
     if action == 'remove':
         await confirm_delete(update, context, session_id)
     elif action == 'confirm_delete':
@@ -468,25 +486,54 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 ### ADD ACTIONS HERE
     elif action in ['contrast', 'bw', 'upscale', 'downscale', 'darker', 'local contrast']:
-        await apply_more_models(action, session_id, update, context)
+        context.user_data['processing'] = True
+        # Remove buttons while processing
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except telegram.error.BadRequest:
+            pass
+        await query.message.reply_text("Editing...")
+        try:
+            await apply_more_models(action, session_id, update, context)
+        finally:
+            context.user_data['processing'] = False
 
-async def remove_file(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: str) -> None:
-    session_info = context.user_data.get('image_sessions', {}).get(session_id)
-    if session_info:
-        for file_path in session_info['adjusted']:
+async def remove_all_files(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handles /remove command — removes all files for the user."""
+    sessions = context.user_data.get('image_sessions', {})
+    if not sessions:
+        await update.message.reply_text("You have no files to remove.")
+        return
+
+    count = 0
+    for session_info in sessions.values():
+        for file_path in session_info.get('adjusted', []):
             if os.path.exists(file_path):
                 os.remove(file_path)
-        
-        del context.user_data['image_sessions'][session_id]
-        
-        context.user_data['files_to_delete'] = [
-            file_info for file_info in context.user_data.get('files_to_delete', [])
-            if file_info['session_id'] != session_id
-        ]
-        
-        await update.callback_query.message.reply_text('All adjusted images for this session have been removed from the system.')
-    else:
-        await update.callback_query.message.reply_text('No file to remove. The session may have expired.')
+                count += 1
+
+    context.user_data['image_sessions'] = {}
+    context.user_data['files_to_delete'] = []
+    await update.message.reply_text(f"Removed {count} file(s) from the system.")
+    logger.info(f"User {update.effective_user.id} removed {count} files via /remove")
+
+async def remove_file(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: str) -> None:
+    """Removes all files for the user (called from button callback)."""
+    sessions = context.user_data.get('image_sessions', {})
+    if not sessions:
+        await update.callback_query.message.reply_text('No files to remove.')
+        return
+
+    count = 0
+    for session_info in sessions.values():
+        for file_path in session_info.get('adjusted', []):
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                count += 1
+
+    context.user_data['image_sessions'] = {}
+    context.user_data['files_to_delete'] = []
+    await update.callback_query.message.reply_text(f'Removed {count} file(s) from the system.')
 
 async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: str) -> None:
     """Sends a confirmation message to the user."""
@@ -503,17 +550,11 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     logger.error("Exception while handling an update:", exc_info=context.error)
 
-    if update:
-        await update.message.reply_text(
+    if update and update.effective_message:
+        await update.effective_message.reply_text(
             "An unexpected error occurred. Please try again later or contact support."
         )
 
-    # Optionally notify the developer
-    if DEVELOPER_CHAT_ID:
-        await context.bot.send_message(
-            chat_id=DEVELOPER_CHAT_ID,
-            text=f"An error occurred:\n{traceback.format_exc()}",
-        )
 # SCHEDULE FUNCTION
 def run_schedule():
     while True:
@@ -543,7 +584,7 @@ def main() -> None:
 
         print("Adding command handlers...")
         application.add_handler(CommandHandler('start', start))
-        application.add_handler(CommandHandler('remove', remove_file))
+        application.add_handler(CommandHandler('remove', remove_all_files))
         application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
         application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         application.add_handler(CallbackQueryHandler(button_callback))
@@ -558,7 +599,7 @@ def main() -> None:
         print("Cleanup job scheduled to run every hour.")
 
         print("Starting cleanup thread...")
-        cleanup_thread = threading.Thread(target=run_schedule)
+        cleanup_thread = threading.Thread(target=run_schedule, daemon=True)
         cleanup_thread.start()
         print("Cleanup thread started.")
 
@@ -571,4 +612,7 @@ def main() -> None:
 
 if __name__ == '__main__':
     print("Starting the bot...")
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)

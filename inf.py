@@ -19,7 +19,6 @@ high_value_threshold = 0.97
 from dotenv import load_dotenv
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
-DEVELOPER_CHAT_ID = os.getenv('DEVELOPER_CHAT_ID')
 
 DEVELOPER_PASSWORD = "HADIE"
 

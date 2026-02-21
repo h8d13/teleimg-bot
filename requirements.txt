@@ -1,10 +1,11 @@
 schedule
 numpy
+scipy
 telegram
 python-telegram-bot
-cv2
+opencv-python
 pillow
 aiohttp
 werkzeug
-dotenv
+python-dotenv
 matplotlib
